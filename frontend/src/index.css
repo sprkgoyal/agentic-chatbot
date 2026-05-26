@@ -1,0 +1,184 @@
+/* Soothing Light Green & Forest Theme Design System */
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --bg-primary: #f4f7f5;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e9efe9;
+  --bg-glass: rgba(255, 255, 255, 0.75);
+  --border-glass: rgba(88, 129, 87, 0.15);
+  
+  --accent-green: #588157;
+  --accent-forest: #3a5a40;
+  --accent-mint: #84a98c;
+  --text-main: #2f3e36;
+  --text-muted: #5e6b60;
+  
+  --accent-cyan: var(--accent-green);
+  --accent-purple: var(--accent-forest);
+  --accent-pink: var(--accent-mint);
+  
+  --text-glow: 0 2px 10px rgba(88, 129, 87, 0.12);
+  --green-glow: 0 4px 15px rgba(88, 129, 87, 0.15);
+  
+  font-family: 'Outfit', sans-serif;
+  color-scheme: light;
+  background-color: var(--bg-primary);
+  color: var(--text-main);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 50%, #f0f5f1 0%, var(--bg-primary) 100%);
+  height: 100vh;
+}
+
+/* Scrollbar Customization */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(88, 129, 87, 0.2);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-green);
+}
+
+/* Glassmorphism Panels */
+.glass-panel {
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-glass);
+  border-radius: 12px;
+  box-shadow: 0 8px 30px 0 rgba(88, 129, 87, 0.04);
+  transition: all 0.3s ease;
+}
+
+.glass-panel:hover {
+  border-color: rgba(88, 129, 87, 0.3);
+  box-shadow: 0 8px 30px 0 rgba(88, 129, 87, 0.08);
+}
+
+/* Text Highlights */
+.glow-text-cyan {
+  color: var(--accent-forest);
+  font-weight: 600;
+}
+
+.glow-text-purple {
+  color: var(--accent-green);
+}
+
+/* Inputs and Buttons */
+.cyber-input {
+  background: var(--bg-secondary);
+  border: 1px solid rgba(88, 129, 87, 0.25);
+  border-radius: 8px;
+  color: var(--text-main);
+  padding: 10px 14px;
+  font-size: 0.95rem;
+  outline: none;
+  transition: all 0.3s ease;
+}
+
+.cyber-input:focus {
+  border-color: var(--accent-forest);
+  box-shadow: 0 0 0 3px rgba(88, 129, 87, 0.15);
+  background: var(--bg-secondary);
+}
+
+.cyber-btn {
+  background: linear-gradient(135deg, var(--accent-forest), var(--accent-green));
+  color: #ffffff;
+  border: none;
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cyber-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(58, 90, 64, 0.25);
+  filter: brightness(1.05);
+}
+
+.cyber-btn:active {
+  transform: translateY(1px);
+}
+
+.cyber-btn-outline {
+  background: transparent;
+  border: 1px solid var(--accent-green);
+  color: var(--accent-green);
+  padding: 9px 17px;
+  border-radius: 8px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cyber-btn-outline:hover {
+  background: rgba(88, 129, 87, 0.05);
+}
+
+/* Animations */
+@keyframes pulse-green {
+  0%, 100% {
+    opacity: 0.7;
+    transform: scale(0.95);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.05);
+  }
+}
+
+.pulse-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 8px #34d399;
+  animation: pulse-green 1.5s infinite ease-in-out;
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s forwards ease-out;
+}
+
+.terminal-font {
+  font-family: 'Fira Code', monospace;
+  font-size: 0.85rem;
+}

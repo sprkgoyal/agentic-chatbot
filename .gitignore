@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+backend/db/chroma/
+
+# Node / React
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Environment variables
+.env
+
+# Editor & System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
