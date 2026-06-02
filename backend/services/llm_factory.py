@@ -60,27 +60,51 @@ def get_llm(temperature: float = 0.2, model_name: str = None):
         raise ValueError(f"Unknown LLM provider: {provider}")
 
 
+import logging
+logger = logging.getLogger("aegis_backend.llm_factory")
+
+class SafeEmbeddings:
+    def __init__(self, actual_embeddings, dim: int = 768):
+        self.actual_embeddings = actual_embeddings
+        self.dim = dim
+        
+    def embed_query(self, text: str) -> list:
+        try:
+            return self.actual_embeddings.embed_query(text)
+        except Exception as e:
+            logger.warning(f"Embedding query failed ({e}). Returning dummy {self.dim}-dim vector.")
+            return [0.0] * self.dim
+            
+    def embed_documents(self, texts: list) -> list:
+        try:
+            return self.actual_embeddings.embed_documents(texts)
+        except Exception as e:
+            logger.warning(f"Embedding documents failed ({e}). Returning dummy {self.dim}-dim vectors.")
+            return [[0.0] * self.dim for _ in texts]
+
 def get_embeddings():
     """
     Returns the appropriate LangChain embeddings class.
     By default:
-      - OpenAI uses 'text-embedding-3-small'
-      - Google Gemini uses 'models/text-embedding-004'
+      - OpenAI uses 'text-embedding-3-small' (dim 1536)
+      - Google Gemini uses 'models/text-embedding-004' (dim 768)
     """
     provider = get_active_provider()
 
     if provider == "openai":
         from langchain_openai import OpenAIEmbeddings
 
-        return OpenAIEmbeddings(
+        actual = OpenAIEmbeddings(
             model="text-embedding-3-small", openai_api_key=os.getenv("OPENAI_API_KEY")
         )
+        return SafeEmbeddings(actual, dim=1536)
     elif provider == "google":
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-        return GoogleGenerativeAIEmbeddings(
+        actual = GoogleGenerativeAIEmbeddings(
             model="models/text-embedding-004",
             google_api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
         )
+        return SafeEmbeddings(actual, dim=768)
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")

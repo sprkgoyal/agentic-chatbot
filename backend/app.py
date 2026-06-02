@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+from datetime import datetime
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,6 +40,27 @@ class ConfluenceSyncRequest(BaseModel):
 class GitHubSyncRequest(BaseModel):
     org_name: str
 
+METADATA_FILE = os.path.join(os.path.dirname(__file__), "db", "metadata.json")
+
+def get_metadata() -> dict:
+    if os.path.exists(METADATA_FILE):
+        try:
+            with open(METADATA_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_confluence_sync": "Never", "last_github_sync": "Never"}
+
+def update_metadata(key: str, value: str):
+    data = get_metadata()
+    data[key] = value
+    try:
+        os.makedirs(os.path.dirname(METADATA_FILE), exist_ok=True)
+        with open(METADATA_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.error(f"Failed to write metadata to file: {e}")
+
 @app.on_event("startup")
 def startup_event():
     logger.info("Initializing AEGIS Chatbot Backend...")
@@ -54,21 +76,26 @@ def startup_event():
 
 @app.get("/api/health")
 def health():
-    """Verify backend and API key configurations."""
+    """Verify backend, API configurations, and last sync times."""
     openai_key = os.getenv("OPENAI_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    meta = get_metadata()
     
     return {
         "status": "healthy",
         "has_openai_key": bool(openai_key),
         "has_google_key": bool(google_key),
-        "active_provider": "openai" if openai_key else ("google" if google_key else "none")
+        "active_provider": "openai" if openai_key else ("google" if google_key else "none"),
+        "confluence_parent_page_id": os.getenv("CONFLUENCE_PARENT_PAGE_ID", "100"),
+        "github_org": os.getenv("GITHUB_ORG", "mock-org"),
+        "last_confluence_sync": meta.get("last_confluence_sync", "Never"),
+        "last_github_sync": meta.get("last_github_sync", "Never")
     }
 
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
     """
-    POST endpoint that runs the agent in a thread pool and yields Server-Sent Events (SSE).
+    POST endpoint that runs the agent asynchronously and yields Server-Sent Events (SSE).
     """
     query_snippet = request.message[:60] + "..." if len(request.message) > 60 else request.message
     logger.info(f"POST /api/chat - Query: '{query_snippet}'")
@@ -82,28 +109,27 @@ async def chat_endpoint(request: ChatRequest):
             detail="Missing API Keys! Please configure OPENAI_API_KEY or GOOGLE_API_KEY / GEMINI_API_KEY."
         )
 
-    loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
 
     def status_cb(msg: str):
         logger.info(f"[Agent Status] {msg}")
-        loop.call_soon_threadsafe(queue.put_nowait, {"type": "status", "message": msg})
+        queue.put_nowait({"type": "status", "message": msg})
 
-    def run_agent():
-        logger.info("Starting agent thread loop execution...")
+    async def run_agent():
+        logger.info("Starting agent async execution...")
         try:
-            for chunk in run_agent_stream(request.message, status_cb):
-                # Only log token lengths for clarity
-                loop.call_soon_threadsafe(queue.put_nowait, {"type": "content", "content": chunk})
-            logger.info("Agent execution completed successfully.")
+            async for chunk in run_agent_stream(request.message, status_cb):
+                await queue.put({"type": "content", "content": chunk})
+            logger.info("Agent async execution completed successfully.")
         except Exception as e:
-            logger.error(f"Error during agent thread execution: {str(e)}", exc_info=True)
-            loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "message": str(e)})
+            logger.error(f"Error during agent async execution: {str(e)}", exc_info=True)
+            await queue.put({"type": "error", "message": str(e)})
         finally:
             logger.info("Terminating SSE client stream.")
-            loop.call_soon_threadsafe(queue.put_nowait, {"type": "done"})
+            await queue.put({"type": "done"})
 
-    loop.run_in_executor(None, run_agent)
+    # Run the agent in the background task loop
+    asyncio.create_task(run_agent())
 
     async def event_generator():
         while True:
@@ -139,6 +165,7 @@ async def sync_confluence_endpoint(request: ConfluenceSyncRequest):
             pages = fetch_confluence_pages_recursive(request.parent_page_id)
             log_cb(f"Fetched {len(pages)} pages. Starting indexing...")
             vector_service.sync_confluence_pages(pages, log_cb)
+            update_metadata("last_confluence_sync", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             log_cb("✅ Confluence indexing finished successfully!")
         except Exception as e:
             logger.error(f"Error during Confluence sync run: {str(e)}", exc_info=True)
@@ -177,6 +204,7 @@ async def sync_github_endpoint(request: GitHubSyncRequest):
         try:
             log_cb(f"🚀 Initializing GitHub Sync for Organization '{request.org_name}'...")
             vector_service.sync_github_organization(request.org_name, log_cb)
+            update_metadata("last_github_sync", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             log_cb("✅ GitHub codebase indexing finished successfully!")
         except Exception as e:
             logger.error(f"Error during GitHub sync run: {str(e)}", exc_info=True)

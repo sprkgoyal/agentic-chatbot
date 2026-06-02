@@ -1,12 +1,15 @@
 import os
 import sys
-from typing import List, Dict, Any, Optional, Callable
+import json
+import logging
+from typing import List, Dict, Any, Optional, Callable, AsyncGenerator
 from langchain.tools import tool
 from langchain_core.messages import SystemMessage, AIMessage, AIMessageChunk
 
 from services.llm_factory import get_llm
 from services.vector_service import VectorService
 from services.document_grader import grade_and_filter_documents
+from services.mcp_client import MCPClient, create_langchain_tool, get_github_host
 
 # Import core tools
 from tools.github_tools import (
@@ -21,6 +24,7 @@ from tools.jira_tools import search_jira_issues, get_jira_issue_details
 
 # Initialize global VectorService
 vector_service = VectorService()
+logger = logging.getLogger("aegis_backend.agent")
 
 # Create dynamic status listener hooks
 _status_callback: Optional[Callable[[str], None]] = None
@@ -89,50 +93,27 @@ def query_confluence_knowledge_base(query: str, page_id: Optional[str] = None) -
     return "\n".join(output)
 
 @tool
-def query_github_codebase(query: str, repo_name: Optional[str] = None) -> str:
+def query_github_repository_metadata(query: str) -> str:
     """
-    Search the GitHub repository codebase vector store for code blocks, classes, functions, or config structures.
-    This tool automatically evaluates and prunes irrelevant code chunks using an LLM grader.
+    Search the GitHub repository metadata vector store for repository names, topics, primary languages, and descriptions.
+    Use this to find which repository is relevant for a given feature, task, or question.
     Parameters:
-      - query: Semantic search query (e.g., 'auth route handling', 'Stripe payment integration')
-      - repo_name: Optional repository name to filter the search (e.g., 'user-service')
+      - query: Semantic search query (e.g. 'authentication service', 'Stripe payment integration')
     """
-    emit_status(f"🔍 Searching GitHub Code VectorStore for: '{query}'...")
+    emit_status(f"🔍 Searching GitHub Repository Metadata for: '{query}'...")
     
-    # Retrieve chunks
-    raw_docs = vector_service.search_github(query, limit=6, repo_filter=repo_name)
-    emit_status(f"💻 Retrieved {len(raw_docs)} code blocks from GitHub DB.")
+    raw_docs = vector_service.search_github(query, limit=5)
+    emit_status(f"💻 Retrieved {len(raw_docs)} repository metadata records.")
     
-    # Grade and filter chunks
-    filtered_docs = grade_and_filter_documents(query, raw_docs, emit_status)
-    
-    if not filtered_docs:
-        return "No relevant code snippets found for your query after relevance grading."
+    if not raw_docs:
+        return "No relevant GitHub repository metadata found."
         
     output = []
-    for doc in filtered_docs:
-        rname = doc.metadata.get("repo_name")
-        fpath = doc.metadata.get("file_path")
-        output.append(f"--- GitHub Repository: '{rname}', File: '{fpath}' ---\n{doc.page_content}\n")
+    for doc in raw_docs:
+        repo = doc.metadata.get("repo_name", "Unknown")
+        output.append(f"--- GitHub Repository Metadata: '{repo}' ---\n{doc.page_content}\n")
         
     return "\n".join(output)
-
-# Combine all tools
-ALL_TOOLS = [
-    # Vector store search tools
-    query_confluence_knowledge_base,
-    query_github_codebase,
-    
-    # Direct live API tools (e.g., for PRs, raw files, lists)
-    list_github_repos,
-    fetch_github_file,
-    list_github_prs,
-    get_github_pr_details,
-    get_github_pages_info,
-    fetch_confluence_hierarchy,
-    search_jira_issues,
-    get_jira_issue_details
-]
 
 SYSTEM_PROMPT = """You are a senior microservices and systems engineer chatbot.
 Your job is to answer developer queries using the internal knowledge base tools (Jira, Confluence, GitHub).
@@ -140,8 +121,8 @@ For each query, choose the most appropriate tool to fetch documentation, code, o
 
 RULES:
 1. Always start by creating or writing a brief TODO list breaking down the steps required to address the user's query. Update your checklist as you proceed.
-2. Always start by checking your vector stores using `query_confluence_knowledge_base` or `query_github_codebase` if searching for general concepts, specs, files, or functions.
-3. For live tasks, stories, epics, or pull requests, query `search_jira_issues` or `list_github_prs` directly.
+2. Always start by checking your vector stores using `query_confluence_knowledge_base` or `query_github_repository_metadata` if searching for general concepts, specs, files, functions, or repository names.
+3. For live tasks, stories, epics, or pull requests, query `search_jira_issues` or other direct tools.
 4. Be extremely concise and professional. Do not add fluff. Focus on service communication, dependency models, and direct answers.
 5. If code is requested, show only the exact relevant code blocks or configuration snippets. Do not dump entire files.
 6. If a tool execution fails, returns errors, or yields empty/incomplete results, analyze the failure, correct your parameters, and call the tool again with adjusted arguments. You are fully capable of executing tools multiple times in a loop to locate the correct file or document.
@@ -152,51 +133,105 @@ def create_agent():
     """Compiles the agent graph using deepagents harness."""
     llm = get_llm(temperature=0.2)
     
+    # Always include static tools
+    tools = [
+        query_confluence_knowledge_base,
+        query_github_repository_metadata,
+        fetch_confluence_hierarchy,
+        search_jira_issues,
+        get_jira_issue_details
+    ]
+    
+    # Check if we should configure the real GitHub MCP client
+    github_token = os.getenv("GITHUB_TOKEN")
+    github_org = os.getenv("GITHUB_ORG", "mock-org")
+    
+    mcp_active = False
+    if github_token and github_org != "mock-org" and github_token != "your_github_personal_access_token_here":
+        try:
+            mcp_env = os.environ.copy()
+            mcp_env["GITHUB_PERSONAL_ACCESS_TOKEN"] = github_token
+            
+            github_host = get_github_host()
+            if "github.com" not in github_host:
+                mcp_env["GITHUB_HOST"] = github_host
+                
+            emit_status("🔌 Connecting to GitHub MCP server in real-API mode...")
+            
+            # Start MCP server subprocess
+            mcp_cmd = ["cmd", "/c", "npx", "-y", "@modelcontextprotocol/server-github"]
+            mcp_client = MCPClient(mcp_cmd, env=mcp_env)
+            mcp_client.start()
+            
+            # Get list of tools and wrap them as LangChain tools
+            mcp_tools = mcp_client.list_tools()
+            logger.info(f"Loaded {len(mcp_tools)} tools from GitHub MCP server.")
+            
+            for m_tool in mcp_tools:
+                lc_tool = create_langchain_tool(mcp_client, m_tool)
+                tools.append(lc_tool)
+                
+            mcp_active = True
+            emit_status("✅ GitHub MCP server tools registered successfully!")
+        except Exception as e:
+            logger.error(f"Error starting GitHub MCP client: {e}", exc_info=True)
+            emit_status(f"⚠️ Failed to start GitHub MCP client. Falling back to mock GitHub tools: {e}")
+            
+    if not mcp_active:
+        logger.info("Registering mock GitHub tools.")
+        tools.extend([
+            list_github_repos,
+            fetch_github_file,
+            list_github_prs,
+            get_github_pr_details,
+            get_github_pages_info
+        ])
+        
     emit_status("⚙️ Initializing deepagent harness...")
     from deepagents import create_deep_agent
     agent = create_deep_agent(
-        tools=ALL_TOOLS,
+        tools=tools,
         system_prompt=SYSTEM_PROMPT,
         model=llm
     )
     return agent
 
-def run_agent_stream(query: str, status_cb: Callable[[str], None]):
+async def run_agent_stream(query: str, status_cb: Callable[[str], None]) -> AsyncGenerator[str, None]:
     """
     Runs the agent and streams both status updates and final output.
-    Uses status_cb to emit background updates.
+    Uses status_cb to emit background updates via langchain astream_events.
     """
     set_status_callback(status_cb)
     agent = create_agent()
     
-    emit_status("🧠 Planning execution strategy...")
-    
-    # Load recursion limit from env, defaulting to 50
     recursion_limit = int(os.getenv("AGENT_RECURSION_LIMIT", "50"))
     emit_status(f"⚙️ Running agent graph (recursion limit: {recursion_limit})...")
     
-    # Use stream_mode="messages" to yield token chunks in real-time
-    response_stream = agent.stream(
+    # Use standard astream_events v2
+    async for event in agent.astream_events(
         {"messages": [("user", query)]},
-        stream_mode="messages",
+        version="v2",
         config={"recursion_limit": recursion_limit}
-    )
-    
-    for chunk in response_stream:
-        # In stream_mode="messages", chunk is a tuple (message, metadata)
-        if isinstance(chunk, tuple) and len(chunk) >= 2:
-            message, metadata = chunk[0], chunk[1]
+    ):
+        event_type = event["event"]
+        name = event["name"]
+        
+        # Tool start event
+        if event_type == "on_tool_start":
+            inputs = event["data"].get("input", {})
+            emit_status(f"🛠️ Agent invoking tool: `{name}` with inputs: {json.dumps(inputs)}")
+        
+        # Tool end event
+        elif event_type == "on_tool_end":
+            emit_status(f"✅ Tool `{name}` finished executing.")
             
-            # Identify message type via class checking (supports AIMessage and AIMessageChunk)
-            if isinstance(message, (AIMessage, AIMessageChunk)):
-                # Check for tool call messages and log them
-                if hasattr(message, "tool_calls") and message.tool_calls:
-                    for tc in message.tool_calls:
-                        emit_status(f"🛠️ Agent invoking tool: `{tc['name']}`")
-                
-                # Yield text deltas
-                text = _extract_text_content(message.content)
+        # Chat model stream event (token chunks)
+        elif event_type == "on_chat_model_stream":
+            chunk = event["data"].get("chunk")
+            if chunk:
+                text = _extract_text_content(chunk.content)
                 if text:
                     yield text
                     
     set_status_callback(None)
+

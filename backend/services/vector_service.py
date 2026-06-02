@@ -31,37 +31,28 @@ class VectorService:
             embedding_function=self.embeddings,
             persist_directory=PERSIST_DIR
         )
+        self.github_repos_metadata_db = Chroma(
+            collection_name="github_repos_metadata",
+            embedding_function=self.embeddings,
+            persist_directory=PERSIST_DIR
+        )
         logger.info(f"Chroma DB connections established in persistent folder: {PERSIST_DIR}")
 
     def _compute_hash(self, content: str) -> str:
         return hashlib.md5(content.encode("utf-8")).hexdigest()
 
-    def _get_code_language(self, file_path: str) -> Optional[Language]:
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext == ".py":
-            return Language.PYTHON
-        elif ext in [".js", ".jsx"]:
-            return Language.JS
-        elif ext in [".ts", ".tsx"]:
-            return Language.TS
-        elif ext == ".html":
-            return Language.HTML
-        elif ext == ".go":
-            return Language.GO
-        elif ext == ".java":
-            return Language.JAVA
-        elif ext == ".cpp" or ext == ".h":
-            return Language.CPP
-        return None
-
     def sync_confluence_pages(self, pages: List[Dict[str, Any]], callback: Optional[Callable[[str], None]] = None):
         """
-        Incrementally index Confluence pages.
+        Incrementally index Confluence pages in bulk.
         If a page hash matches existing metadata, skip. Otherwise, delete and re-index.
         """
         logger.info(f"Starting Confluence VectorStore sync for {len(pages)} pages.")
+        
+        all_docs_to_add = []
+        ids_to_delete = []
+        
         for page in pages:
-            page_id = page["id"]
+            page_id = str(page["id"])
             title = page["title"]
             body = page["body"]
             parent_id = page.get("parent_id")
@@ -86,12 +77,12 @@ class VectorService:
                         callback(msg)
                     continue
                 
-                # If hash differs, delete old chunks
-                msg = f"-> Page content updated. Purging old chunks for '{title}'..."
+                # If hash differs, queue old chunks for deletion
+                msg = f"-> Page content updated. Queueing old chunks deletion for '{title}'..."
                 logger.info(msg)
                 if callback:
                     callback(msg)
-                self.confluence_db.delete(ids=existing["ids"])
+                ids_to_delete.extend(existing["ids"])
             
             # Smart chunking for Confluence: Recursive Text Splitter
             splitter = RecursiveCharacterTextSplitter(
@@ -101,7 +92,6 @@ class VectorService:
             )
             
             chunks = splitter.split_text(body)
-            docs = []
             for i, chunk in enumerate(chunks):
                 doc = Document(
                     page_content=f"Page Title: {title}\nContent:\n{chunk}",
@@ -115,114 +105,79 @@ class VectorService:
                         "source": "confluence"
                     }
                 )
-                docs.append(doc)
+                all_docs_to_add.append(doc)
+                
+            msg = f"-> Prepared '{title}' in {len(chunks)} chunks."
+            logger.info(msg)
+            if callback:
+                callback(msg)
+                
+        # Bulk Database Writes
+        if ids_to_delete:
+            msg = f"Deleting {len(ids_to_delete)} outdated Confluence chunks..."
+            logger.info(msg)
+            if callback:
+                callback(msg)
+            self.confluence_db.delete(ids=ids_to_delete)
             
-            if docs:
-                self.confluence_db.add_documents(docs)
-                msg = f"-> Indexed '{title}' in {len(docs)} chunks."
-                logger.info(msg)
-                if callback:
-                    callback(msg)
-                    
+        if all_docs_to_add:
+            msg = f"Adding {len(all_docs_to_add)} chunks to Confluence DB..."
+            logger.info(msg)
+            if callback:
+                callback(msg)
+            self.confluence_db.add_documents(all_docs_to_add)
+            
         logger.info("Confluence VectorStore sync completed.")
 
     def sync_github_organization(self, org_name: str, callback: Optional[Callable[[str], None]] = None):
         """
-        Incrementally index all repos in a GitHub Organization.
-        Iterate through files, check hash, and index code with syntax splitters.
+        Incrementally index metadata about all repos in a GitHub Organization.
+        Uses vectorstore to store metadata about github repos.
         """
-        logger.info(f"Starting GitHub VectorStore sync for organization: '{org_name}'")
+        logger.info(f"Starting GitHub Repository metadata sync for organization: '{org_name}'")
         github_token = os.getenv("GITHUB_TOKEN")
         
-        if github_token and org_name != "mock-org":
-            # Real GitHub API syncing
+        repos = []
+        
+        if github_token and org_name != "mock-org" and github_token != "your_github_personal_access_token_here":
+            # Real GitHub API syncing for repository list
             import requests
+            from tools.github_tools import get_github_api_base
+            api_base = get_github_api_base()
+            
             headers = {
                 "Accept": "application/vnd.github.v3+json",
                 "Authorization": f"token {github_token}"
             }
             
-            msg = f"Fetching repository list for organization '{org_name}'..."
+            msg = f"Fetching repository list for organization '{org_name}' from {api_base}..."
             logger.info(msg)
             if callback:
                 callback(msg)
                 
-            repos_url = f"https://api.github.com/orgs/{org_name}/repos"
+            repos_url = f"{api_base}/orgs/{org_name}/repos?per_page=100"
             try:
-                res = requests.get(repos_url, headers=headers)
+                res = requests.get(repos_url, headers=headers, timeout=15)
                 if res.status_code != 200:
-                    msg = f"Failed to fetch repositories (Status: {res.status_code}). Aborting."
+                    # Fallback to user repos if org repos fails or if it's a user rather than org
+                    user_repos_url = f"{api_base}/users/{org_name}/repos?per_page=100"
+                    logger.warning(f"Org repos fetch failed. Trying user repos: {user_repos_url}...")
+                    res = requests.get(user_repos_url, headers=headers, timeout=15)
+                    
+                if res.status_code == 200:
+                    repos = res.json()
+                else:
+                    msg = f"Failed to fetch repositories (Status: {res.status_code}). Response: {res.text}. Aborting."
                     logger.error(msg)
                     if callback:
                         callback(msg)
                     return
-                repos = res.json()
             except Exception as e:
                 msg = f"Error fetching repos: {str(e)}"
                 logger.error(msg, exc_info=True)
                 if callback:
                     callback(msg)
                 return
-                
-            for repo in repos:
-                repo_name = repo["name"]
-                msg = f"Processing repository '{repo_name}'..."
-                logger.info(msg)
-                if callback:
-                    callback(msg)
-                
-                # Fetch repo file tree recursively
-                tree_url = f"https://api.github.com/repos/{org_name}/{repo_name}/git/trees/{repo['default_branch']}?recursive=1"
-                try:
-                    tree_res = requests.get(tree_url, headers=headers)
-                    if tree_res.status_code != 200:
-                        msg = f"-> Failed to fetch file tree for '{repo_name}'. Skipping."
-                        logger.warning(msg)
-                        if callback:
-                            callback(msg)
-                        continue
-                    tree_data = tree_res.json()
-                    files = [node for node in tree_data.get("tree", []) if node["type"] == "blob"]
-                except Exception as e:
-                    msg = f"-> Error fetching tree: {str(e)}"
-                    logger.error(msg, exc_info=True)
-                    if callback:
-                        callback(msg)
-                    continue
-                    
-                for file_node in files:
-                    file_path = file_node["path"]
-                    # Skip binary or unwanted extensions
-                    ext = os.path.splitext(file_path)[1].lower()
-                    if ext in [".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".pyc", ".db"]:
-                        continue
-                        
-                    file_sha = file_node["sha"]
-                    
-                    # Check if file already indexed and unchanged
-                    existing = self.github_db.get(where={"$and": [{"repo_name": {"$eq": repo_name}}, {"file_path": {"$eq": file_path}}]})
-                    if existing and existing["ids"]:
-                        first_meta = existing["metadatas"][0]
-                        if first_meta.get("hash") == file_sha:
-                            continue
-                        # If changed, delete
-                        logger.info(f"File '{file_path}' in repo '{repo_name}' updated. Purging old chunks.")
-                        self.github_db.delete(ids=existing["ids"])
-                        
-                    # Fetch file content
-                    raw_url = f"https://api.github.com/repos/{org_name}/{repo_name}/contents/{file_path}"
-                    try:
-                        content_res = requests.get(raw_url, headers=headers)
-                        if content_res.status_code == 200:
-                            import base64
-                            content_data = content_res.json()
-                            content = base64.b64decode(content_data["content"]).decode("utf-8", errors="ignore")
-                            self._index_single_file(repo_name, file_path, content, file_sha, callback)
-                    except Exception as e:
-                        msg = f"--> Error indexing file {file_path}: {e}"
-                        logger.error(msg, exc_info=True)
-                        if callback:
-                            callback(msg)
         else:
             # Fallback to Mock Organization database sync
             msg = f"Using Mock GitHub Organization '{org_name}'..."
@@ -230,81 +185,80 @@ class VectorService:
             if callback:
                 callback(msg)
                 
-            for repo_name, repo in MOCK_GITHUB_REPOS.items():
-                msg = f"Processing repository '{repo_name}'..."
-                logger.info(msg)
-                if callback:
-                    callback(msg)
-                    
-                for file_path, content in repo["files"].items():
-                    file_sha = self._compute_hash(content)
-                    
-                    # Check if file already indexed and unchanged
-                    existing = self.github_db.get(where={"file_path": file_path})
-                    matches_existing = False
-                    if existing and existing["ids"]:
-                        for idx, meta in enumerate(existing["metadatas"]):
-                            if meta.get("repo_name") == repo_name and meta.get("hash") == file_sha:
-                                matches_existing = True
-                                break
-                                
-                        if matches_existing:
-                            msg = f"-> File '{file_path}' in repo '{repo_name}' is up to date. Skipping."
-                            logger.info(msg)
-                            if callback:
-                                callback(msg)
-                            continue
-                            
-                        # If hash differs, delete specific chunks
-                        matching_ids = [existing["ids"][idx] for idx, meta in enumerate(existing["metadatas"]) if meta.get("repo_name") == repo_name]
-                        if matching_ids:
-                            logger.info(f"Mock file '{file_path}' in '{repo_name}' updated. Purging old chunks.")
-                            self.github_db.delete(ids=matching_ids)
-                            
-                    self._index_single_file(repo_name, file_path, content, file_sha, callback)
-                    
-        logger.info("GitHub VectorStore sync completed.")
-
-    def _index_single_file(self, repo_name: str, file_path: str, content: str, file_sha: str, callback: Optional[Callable[[str], None]]):
-        """Index a single code file into the VectorStore using syntax-aware splitters."""
-        lang = self._get_code_language(file_path)
+            repos = [
+                {
+                    "name": name,
+                    "description": data.get("description", "No description"),
+                    "language": data.get("language", "Python"),
+                    "topics": data.get("topics", []),
+                    "default_branch": "main"
+                } for name, data in MOCK_GITHUB_REPOS.items()
+            ]
+            
+        docs_to_add = []
+        ids_to_delete = []
         
-        if lang:
-            # Use syntax-aware code splitter
-            splitter = RecursiveCharacterTextSplitter.from_language(
-                language=lang,
-                chunk_size=1200,
-                chunk_overlap=200
-            )
-        else:
-            # Standard splitter
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=150
+        for repo in repos:
+            repo_name = repo["name"]
+            desc = repo.get("description") or "No description"
+            lang = repo.get("language") or "Unknown"
+            topics = repo.get("topics") or []
+            branch = repo.get("default_branch") or "main"
+            
+            topics_str = ", ".join(topics) if isinstance(topics, list) else str(topics)
+            
+            # Format repository metadata text representation for vector search
+            content = (
+                f"Repository Name: {repo_name}\n"
+                f"Description: {desc}\n"
+                f"Primary Language: {lang}\n"
+                f"Topics: {topics_str}\n"
+                f"Default Branch: {branch}"
             )
             
-        chunks = splitter.split_text(content)
-        docs = []
-        for i, chunk in enumerate(chunks):
-            doc = Document(
-                page_content=f"Repository: {repo_name}\nFile: {file_path}\nCode:\n{chunk}",
-                metadata={
-                    "repo_name": repo_name,
-                    "file_path": file_path,
-                    "hash": file_sha,
-                    "chunk_index": i,
-                    "language": lang.value if lang else "text",
-                    "source": "github"
-                }
-            )
-            docs.append(doc)
+            content_hash = self._compute_hash(content)
             
-        if docs:
-            self.github_db.add_documents(docs)
-            msg = f"-> Indexed file '{file_path}' in {len(docs)} chunks."
+            msg = f"Checking repository metadata for '{repo_name}'..."
             logger.info(msg)
             if callback:
                 callback(msg)
+            
+            # Check if exists with same hash
+            existing = self.github_repos_metadata_db.get(where={"repo_name": repo_name})
+            if existing and existing["ids"]:
+                first_meta = existing["metadatas"][0]
+                if first_meta.get("hash") == content_hash:
+                    msg = f"-> Repository metadata for '{repo_name}' is up to date. Skipping."
+                    logger.info(msg)
+                    if callback:
+                        callback(msg)
+                    continue
+                ids_to_delete.extend(existing["ids"])
+            
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "repo_name": repo_name,
+                    "hash": content_hash,
+                    "source": "github_metadata"
+                }
+            )
+            docs_to_add.append(doc)
+            msg = f"-> Prepared metadata for repo '{repo_name}'."
+            logger.info(msg)
+            if callback:
+                callback(msg)
+                
+        if ids_to_delete:
+            self.github_repos_metadata_db.delete(ids=ids_to_delete)
+        if docs_to_add:
+            self.github_repos_metadata_db.add_documents(docs_to_add)
+            msg = f"✅ Indexed metadata for {len(docs_to_add)} repositories."
+            logger.info(msg)
+            if callback:
+                callback(msg)
+                
+        logger.info("GitHub VectorStore sync completed.")
 
     def search_confluence(self, query: str, limit: int = 5, page_filter: Optional[str] = None) -> List[Document]:
         """Smart retrieval on Confluence database with optional page_id metadata filter."""
@@ -312,28 +266,24 @@ class VectorService:
         where_filter = {"source": "confluence"}
         if page_filter:
             where_filter = {
-                "$and": [
-                    {"source": {"$eq": "confluence"}},
-                    {"page_id": {"$eq": page_filter}}
-                ]
+                "source": "confluence",
+                "page_id": page_filter
             }
             
-        results = self.confluence_db.similarity_search(query, k=limit, where=where_filter)
+        results = self.confluence_db.similarity_search(query, k=limit, filter=where_filter)
         logger.info(f"Confluence similarity search retrieved {len(results)} candidate documents.")
         return results
 
     def search_github(self, query: str, limit: int = 5, repo_filter: Optional[str] = None) -> List[Document]:
-        """Smart retrieval on GitHub database with optional repo_name metadata filter."""
-        logger.info(f"Searching GitHub vector store. Query: '{query}', limit: {limit}, repo_filter: {repo_filter}")
-        where_filter = {"source": "github"}
+        """Smart retrieval on GitHub metadata database with optional repo_name metadata filter."""
+        logger.info(f"Searching GitHub metadata vector store. Query: '{query}', limit: {limit}, repo_filter: {repo_filter}")
+        where_filter = {"source": "github_metadata"}
         if repo_filter:
             where_filter = {
-                "$and": [
-                    {"source": {"$eq": "github"}},
-                    {"repo_name": {"$eq": repo_filter}}
-                ]
+                "source": "github_metadata",
+                "repo_name": repo_filter
             }
             
-        results = self.github_db.similarity_search(query, k=limit, where=where_filter)
-        logger.info(f"GitHub similarity search retrieved {len(results)} candidate code blocks.")
+        results = self.github_repos_metadata_db.similarity_search(query, k=limit, filter=where_filter)
+        logger.info(f"GitHub similarity search retrieved {len(results)} candidate metadata documents.")
         return results

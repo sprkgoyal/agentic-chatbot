@@ -1,21 +1,32 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Database, RefreshCw, Terminal } from 'lucide-react';
 
-export default function SyncPanel() {
-  const [confluenceId, setConfluenceId] = useState('100');
-  const [githubOrg, setGithubOrg] = useState('mock-org');
+export default function SyncPanel({ 
+  defaultConfluenceId = '100', 
+  defaultGithubOrg = 'mock-org',
+  lastConfluenceSync = 'Never',
+  lastGithubSync = 'Never',
+  onSyncSuccess
+}) {
+  const [confluenceId, setConfluenceId] = useState(defaultConfluenceId);
+  const [githubOrg, setGithubOrg] = useState(defaultGithubOrg);
   const [syncingType, setSyncingType] = useState(null); // 'confluence', 'github', or null
   const [logs, setLogs] = useState([]);
   
-  // Last sync timestamps stored in localStorage
-  const [lastConfluenceSync, setLastConfluenceSync] = useState(
-    () => localStorage.getItem('last_confluence_sync') || 'Never'
-  );
-  const [lastGithubSync, setLastGithubSync] = useState(
-    () => localStorage.getItem('last_github_sync') || 'Never'
-  );
-  
   const logEndRef = useRef(null);
+
+  // Sync inputs with defaults loaded from server
+  useEffect(() => {
+    if (defaultConfluenceId) {
+      setConfluenceId(defaultConfluenceId);
+    }
+  }, [defaultConfluenceId]);
+
+  useEffect(() => {
+    if (defaultGithubOrg) {
+      setGithubOrg(defaultGithubOrg);
+    }
+  }, [defaultGithubOrg]);
 
   useEffect(() => {
     if (logEndRef.current) {
@@ -60,8 +71,7 @@ export default function SyncPanel() {
               } else if (data.type === 'done') {
                 const timestamp = new Date().toLocaleString();
                 setLogs((prev) => [...prev, `🎉 Sync completed at ${timestamp}`]);
-                localStorage.setItem('last_confluence_sync', timestamp);
-                setLastConfluenceSync(timestamp);
+                if (onSyncSuccess) onSyncSuccess();
               }
             } catch (err) {
               // Ignore partial JSON parse errors
@@ -113,8 +123,7 @@ export default function SyncPanel() {
               } else if (data.type === 'done') {
                 const timestamp = new Date().toLocaleString();
                 setLogs((prev) => [...prev, `🎉 Sync completed at ${timestamp}`]);
-                localStorage.setItem('last_github_sync', timestamp);
-                setLastGithubSync(timestamp);
+                if (onSyncSuccess) onSyncSuccess();
               }
             } catch (err) {
               // Ignore partial JSON parse errors

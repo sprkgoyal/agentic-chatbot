@@ -1,3 +1,4 @@
+// Aligning with LangChain's message structures for maximum compatibility
 import React, { useState, useEffect, useRef } from 'react';
 import { Bot, User, Send, Wifi, WifiOff, Code, Layers, Loader2 } from 'lucide-react';
 import SyncPanel from './components/SyncPanel';
@@ -63,7 +64,16 @@ function App() {
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [healthStatus, setHealthStatus] = useState({ status: 'offline', has_openai_key: false, has_google_key: false, active_provider: 'none' });
+  const [healthStatus, setHealthStatus] = useState({ 
+    status: 'offline', 
+    has_openai_key: false, 
+    has_google_key: false, 
+    active_provider: 'none',
+    confluence_parent_page_id: '100',
+    github_org: 'mock-org',
+    last_confluence_sync: 'Never',
+    last_github_sync: 'Never'
+  });
   const [agentStatusLogs, setAgentStatusLogs] = useState([]);
   
   const messagesEndRef = useRef(null);
@@ -84,10 +94,28 @@ function App() {
           const data = await response.json();
           setHealthStatus(data);
         } else {
-          setHealthStatus({ status: 'error', has_openai_key: false, has_google_key: false, active_provider: 'none' });
+          setHealthStatus({ 
+            status: 'error', 
+            has_openai_key: false, 
+            has_google_key: false, 
+            active_provider: 'none',
+            confluence_parent_page_id: '100',
+            github_org: 'mock-org',
+            last_confluence_sync: 'Never',
+            last_github_sync: 'Never'
+          });
         }
       } catch (err) {
-        setHealthStatus({ status: 'offline', has_openai_key: false, has_google_key: false, active_provider: 'none' });
+        setHealthStatus({ 
+          status: 'offline', 
+          has_openai_key: false, 
+          has_google_key: false, 
+          active_provider: 'none',
+          confluence_parent_page_id: '100',
+          github_org: 'mock-org',
+          last_confluence_sync: 'Never',
+          last_github_sync: 'Never'
+        });
       }
     };
     
@@ -351,7 +379,21 @@ function App() {
 
         {/* Right Side: Sync Center Panel */}
         <section style={{ height: '100%' }}>
-          <SyncPanel />
+          <SyncPanel 
+            defaultConfluenceId={healthStatus.confluence_parent_page_id} 
+            defaultGithubOrg={healthStatus.github_org}
+            lastConfluenceSync={healthStatus.last_confluence_sync}
+            lastGithubSync={healthStatus.last_github_sync}
+            onSyncSuccess={async () => {
+              try {
+                const response = await fetch('http://localhost:8000/api/health');
+                if (response.ok) {
+                  const data = await response.json();
+                  setHealthStatus(data);
+                }
+              } catch (err) {}
+            }}
+          />
         </section>
 
       </main>
