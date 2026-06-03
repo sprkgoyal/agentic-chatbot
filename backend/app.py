@@ -3,16 +3,17 @@ import json
 import logging
 import asyncio
 from datetime import datetime
-from typing import Dict, Any, Optional
-from fastapi import FastAPI, Request, HTTPException
+from typing import Dict, Any, Optional, List
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from agent import run_agent_stream, vector_service
-from tools.confluence_tools import fetch_confluence_pages_recursive
+from tools.confluence_tools import fetch_confluence_pages_by_space
+from services import db_manager
 
-# Configure standard python logging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -22,7 +23,7 @@ logger = logging.getLogger("aegis_backend")
 
 app = FastAPI(title="Agentic Chatbot Backend")
 
-# Enable CORS for the frontend React application
+# Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,14 +32,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Request Models ---
+
+class LoginRequest(BaseModel):
+    username: str
+    password: Optional[str] = None
+    role: Optional[str] = "customer" # Default role for auto-register
+    name: Optional[str] = None
+    userpic: Optional[str] = "avatar_1"
+
+class UpdateSettingsRequest(BaseModel):
+    name: str
+    userpic: str
+
 class ChatRequest(BaseModel):
     message: str
+    conversation_id: str
+
+class ConversationRequest(BaseModel):
+    title: str
 
 class ConfluenceSyncRequest(BaseModel):
-    parent_page_id: str
-
-class GitHubSyncRequest(BaseModel):
-    org_name: str
+    space_id: str
 
 METADATA_FILE = os.path.join(os.path.dirname(__file__), "db", "metadata.json")
 
@@ -61,44 +76,173 @@ def update_metadata(key: str, value: str):
     except Exception as e:
         logger.error(f"Failed to write metadata to file: {e}")
 
-@app.on_event("startup")
-def startup_event():
-    logger.info("Initializing AEGIS Chatbot Backend...")
-    openai_key = os.getenv("OPENAI_API_KEY")
-    google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    
-    if openai_key:
-        logger.info("Active Provider: OpenAI (found OPENAI_API_KEY)")
-    if google_key:
-        logger.info("Active Provider: Google Gemini (found GOOGLE_API_KEY/GEMINI_API_KEY)")
-    if not openai_key and not google_key:
-        logger.warning("No LLM API keys found! System will require configurations prior to running queries.")
+# --- Auth Dependencies ---
 
-@app.get("/api/health")
-def health():
-    """Verify backend, API configurations, and last sync times."""
-    openai_key = os.getenv("OPENAI_API_KEY")
-    google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-    meta = get_metadata()
-    
+async def get_current_user(request: Request) -> dict:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid token")
+    token = auth_header.split(" ")[1]
+    user = db_manager.get_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized: Session expired or invalid")
+    # Return user dict along with the token
+    user["token"] = token
+    return user
+
+def get_customer(user: dict = Depends(get_current_user)) -> dict:
+    if user["role"] != "customer":
+        raise HTTPException(status_code=403, detail="Forbidden: Customer role required")
+    return user
+
+def get_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden: Admin role required")
+    return user
+
+# --- Auth API ---
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    username = req.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username cannot be empty")
+        
+    user = db_manager.get_user_by_username(username)
+    if not user:
+        # Auto-register
+        role = req.role if req.role in ["customer", "admin"] else "customer"
+        name = req.name.strip() if req.name else username
+        userpic = req.userpic if req.userpic else "avatar_1"
+        try:
+            user = db_manager.create_user(username, req.password, role, name, userpic)
+            logger.info(f"Auto-registered new user: {username} ({role})")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to register user: {str(e)}")
+            
+    token = db_manager.create_session(user["id"])
     return {
-        "status": "healthy",
-        "has_openai_key": bool(openai_key),
-        "has_google_key": bool(google_key),
-        "active_provider": "openai" if openai_key else ("google" if google_key else "none"),
-        "confluence_parent_page_id": os.getenv("CONFLUENCE_PARENT_PAGE_ID", "100"),
-        "github_org": os.getenv("GITHUB_ORG", "mock-org"),
-        "last_confluence_sync": meta.get("last_confluence_sync", "Never"),
-        "last_github_sync": meta.get("last_github_sync", "Never")
+        "token": token,
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "role": user["role"],
+            "name": user["name"],
+            "userpic": user["userpic"]
+        }
     }
 
+@app.post("/api/auth/logout")
+def logout(user: dict = Depends(get_current_user)):
+    db_manager.delete_session(user["token"])
+    return {"message": "Logged out successfully"}
+
+@app.get("/api/auth/me")
+def get_me(user: dict = Depends(get_current_user)):
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+        "name": user["name"],
+        "userpic": user["userpic"]
+    }
+
+@app.delete("/api/auth/delete-account")
+def delete_account(user: dict = Depends(get_current_user)):
+    success = db_manager.delete_user_account(user["id"])
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete account")
+    return {"message": "Account deleted successfully"}
+
+# --- User Settings API ---
+
+@app.put("/api/user/settings")
+def update_settings(req: UpdateSettingsRequest, user: dict = Depends(get_current_user)):
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+    success = db_manager.update_user_profile(user["id"], name, req.userpic)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update settings")
+    return {"message": "Profile updated successfully"}
+
+# --- Conversations API ---
+
+@app.get("/api/conversations")
+def list_chats(user: dict = Depends(get_customer)):
+    return db_manager.list_conversations(user["id"])
+
+@app.post("/api/conversations")
+def create_chat(req: ConversationRequest, user: dict = Depends(get_customer)):
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+    return db_manager.create_conversation(user["id"], title)
+
+@app.delete("/api/conversations/{conv_id}")
+def delete_chat(conv_id: str, user: dict = Depends(get_customer)):
+    conv = db_manager.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    success = db_manager.delete_conversation(conv_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete conversation")
+    return {"message": "Conversation deleted"}
+
+@app.get("/api/conversations/{conv_id}/messages")
+def get_messages(conv_id: str, user: dict = Depends(get_customer)):
+    conv = db_manager.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return db_manager.list_messages(conv_id)
+
+@app.get("/api/conversations/{conv_id}/download")
+def download_chat(conv_id: str, user: dict = Depends(get_customer)):
+    conv = db_manager.get_conversation(conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    messages = db_manager.list_messages(conv_id)
+    
+    txt_content = []
+    txt_content.append(f"Conversation Title: {conv['title']}")
+    txt_content.append(f"Exported Date: {datetime.now().isoformat()}")
+    txt_content.append("="*40 + "\n")
+    
+    for msg in messages:
+        sender = "User" if msg["role"] == "user" else "AI Assistant"
+        txt_content.append(f"[{msg['created_at']}] {sender}: {msg['content']}")
+        txt_content.append("-" * 20)
+        
+    return PlainTextResponse("\n".join(txt_content), headers={
+        "Content-Disposition": f"attachment; filename=chat_{conv_id}.txt"
+    })
+
+# --- Chat Stream ---
+
 @app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, user: dict = Depends(get_customer)):
     """
-    POST endpoint that runs the agent asynchronously and yields Server-Sent Events (SSE).
+    POST endpoint that runs the agent and yields Server-Sent Events (SSE).
+    Saves conversation history to the SQLite database.
     """
-    query_snippet = request.message[:60] + "..." if len(request.message) > 60 else request.message
-    logger.info(f"POST /api/chat - Query: '{query_snippet}'")
+    conv = db_manager.get_conversation(request.conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conv["user_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # 1. Save user message to database
+    db_manager.create_message(request.conversation_id, "user", request.message)
+
+    # 2. Get conversation history (excluding the current user message since it will be passed explicitly)
+    history_messages = db_manager.list_messages(request.conversation_id)[:-1]
 
     openai_key = os.getenv("OPENAI_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
@@ -118,7 +262,7 @@ async def chat_endpoint(request: ChatRequest):
     async def run_agent():
         logger.info("Starting agent async execution...")
         try:
-            async for chunk in run_agent_stream(request.message, status_cb):
+            async for chunk in run_agent_stream(request.message, status_cb, history_messages):
                 await queue.put({"type": "content", "content": chunk})
             logger.info("Agent async execution completed successfully.")
         except Exception as e:
@@ -132,26 +276,49 @@ async def chat_endpoint(request: ChatRequest):
     asyncio.create_task(run_agent())
 
     async def event_generator():
+        ai_response_accum = []
+        status_logs_accum = []
+        is_err = False
+        
         while True:
             item = await queue.get()
             if item["type"] == "done":
+                # Save AI message to DB when finished
+                full_reply = "".join(ai_response_accum)
+                if full_reply or is_err:
+                    db_manager.create_message(
+                        request.conversation_id, 
+                        "ai", 
+                        full_reply if full_reply else "An error occurred.", 
+                        is_error=is_err, 
+                        status_logs=status_logs_accum
+                    )
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 break
             elif item["type"] == "error":
+                is_err = True
+                status_logs_accum.append(f"Error: {item['message']}")
                 yield f"data: {json.dumps({'type': 'error', 'message': item['message']})}\n\n"
                 break
+            elif item["type"] == "status":
+                status_logs_accum.append(item["message"])
+                yield f"data: {json.dumps(item)}\n\n"
             else:
+                ai_response_accum.append(item["content"])
                 yield f"data: {json.dumps(item)}\n\n"
             queue.task_done()
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+# --- Sync API (Admin Only) ---
+
 @app.post("/api/sync/confluence")
-async def sync_confluence_endpoint(request: ConfluenceSyncRequest):
+async def sync_confluence_endpoint(request: ConfluenceSyncRequest, user: dict = Depends(get_admin)):
     """
-    Streams Confluence synchronization progress logs in real-time.
+    Streams Confluence synchronization progress logs in real-time. Admin only.
     """
-    logger.info(f"POST /api/sync/confluence - Parent Page ID: '{request.parent_page_id}'")
+    space_id = request.space_id.strip()
+    logger.info(f"POST /api/sync/confluence - Space ID: '{space_id}'")
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
 
@@ -161,12 +328,12 @@ async def sync_confluence_endpoint(request: ConfluenceSyncRequest):
 
     def run_sync():
         try:
-            log_cb(f"🚀 Initializing Confluence Sync recursively for Page ID '{request.parent_page_id}'...")
-            pages = fetch_confluence_pages_recursive(request.parent_page_id)
+            log_cb(f"🚀 Initializing Confluence Sync for Space ID '{space_id}' using CQL...")
+            pages = fetch_confluence_pages_by_space(space_id)
             log_cb(f"Fetched {len(pages)} pages. Starting indexing...")
-            vector_service.sync_confluence_pages(pages, log_cb)
+            vector_service.sync_confluence_pages(pages, space_id, log_cb)
             update_metadata("last_confluence_sync", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            log_cb("✅ Confluence indexing finished successfully!")
+            log_cb("✅ Confluence space indexing finished successfully!")
         except Exception as e:
             logger.error(f"Error during Confluence sync run: {str(e)}", exc_info=True)
             log_cb(f"❌ Error during Confluence sync: {str(e)}")
@@ -187,44 +354,22 @@ async def sync_confluence_endpoint(request: ConfluenceSyncRequest):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-@app.post("/api/sync/github")
-async def sync_github_endpoint(request: GitHubSyncRequest):
-    """
-    Streams GitHub repository synchronization logs in real-time.
-    """
-    logger.info(f"POST /api/sync/github - Organization: '{request.org_name}'")
-    loop = asyncio.get_running_loop()
-    queue = asyncio.Queue()
+# --- Health Check ---
 
-    def log_cb(msg: str):
-        logger.info(f"[GitHub Sync] {msg}")
-        loop.call_soon_threadsafe(queue.put_nowait, msg)
-
-    def run_sync():
-        try:
-            log_cb(f"🚀 Initializing GitHub Sync for Organization '{request.org_name}'...")
-            vector_service.sync_github_organization(request.org_name, log_cb)
-            update_metadata("last_github_sync", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            log_cb("✅ GitHub codebase indexing finished successfully!")
-        except Exception as e:
-            logger.error(f"Error during GitHub sync run: {str(e)}", exc_info=True)
-            log_cb(f"❌ Error during GitHub sync: {str(e)}")
-        finally:
-            logger.info("GitHub sync stream finalized.")
-            loop.call_soon_threadsafe(queue.put_nowait, "DONE")
-
-    loop.run_in_executor(None, run_sync)
-
-    async def event_generator():
-        while True:
-            msg = await queue.get()
-            if msg == "DONE":
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                break
-            yield f"data: {json.dumps({'type': 'log', 'message': msg})}\n\n"
-            queue.task_done()
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+@app.get("/api/health")
+def health():
+    """Verify backend, API configurations, and last sync times."""
+    openai_key = os.getenv("OPENAI_API_KEY")
+    google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    meta = get_metadata()
+    
+    return {
+        "status": "healthy",
+        "has_openai_key": bool(openai_key),
+        "has_google_key": bool(google_key),
+        "active_provider": "openai" if openai_key else ("google" if google_key else "none"),
+        "last_confluence_sync": meta.get("last_confluence_sync", "Never"),
+    }
 
 if __name__ == "__main__":
     import uvicorn

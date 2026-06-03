@@ -167,6 +167,96 @@ def fetch_confluence_pages_recursive(parent_page_id: str) -> List[Dict[str, Any]
                 
     return results
 
+def fetch_confluence_pages_by_space(space_id: str) -> List[Dict[str, Any]]:
+    """
+    Fetch all pages in a given space using CQL query on /rest/api/content/search.
+    e.g., space = 'SPACE_KEY' AND type = 'page'
+    """
+    auth = _get_auth()
+    space_key = str(space_id).strip()
+    
+    results = []
+    if CONFLUENCE_URL and CONFLUENCE_API_TOKEN:
+        base_url = CONFLUENCE_URL.rstrip('/')
+        headers = {"Accept": "application/json"}
+        
+        if CONFLUENCE_USERNAME:
+            request_auth = (CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN)
+        else:
+            headers["Authorization"] = f"Bearer {CONFLUENCE_API_TOKEN}"
+            request_auth = None
+
+        cql = f"space = '{space_key}' AND type = 'page'"
+        url = f"{base_url}/rest/api/content/search"
+        
+        try:
+            logger.info(f"Confluence CQL API: Fetching pages in space '{space_key}' from {url}...")
+            params = {
+                "cql": cql,
+                "expand": "body.storage,version,ancestors",
+                "limit": 100
+            }
+            res = requests.get(url, auth=request_auth, headers=headers, params=params, timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                fetched_pages = data.get("results", [])
+                logger.info(f"Successfully fetched {len(fetched_pages)} pages from {url}")
+                
+                for item in fetched_pages:
+                    page_id = str(item.get("id"))
+                    title = item.get("title", "")
+                    body = item.get("body", {}).get("storage", {}).get("value", "")
+                    
+                    ancestors = item.get("ancestors", [])
+                    parent_id = str(ancestors[-1]["id"]) if ancestors else None
+                    last_updated = item.get("version", {}).get("when", "")
+                    
+                    results.append({
+                        "id": page_id,
+                        "space_id": space_key,
+                        "title": title,
+                        "body": body,
+                        "parent_id": parent_id,
+                        "last_updated": last_updated
+                    })
+                return results
+            else:
+                logger.error(f"Confluence CQL search failed with status {res.status_code}: {res.text}")
+        except Exception as e:
+            logger.error(f"Error calling Confluence CQL search API at {url}: {e}")
+
+    # Fallback to Mock Data
+    logger.info(f"Falling back to mock Confluence data for space '{space_key}'...")
+    for pid, mock_page in MOCK_CONFLUENCE_PAGES.items():
+        results.append({
+            "id": pid,
+            "space_id": space_key,
+            "title": mock_page.get("title", ""),
+            "body": mock_page.get("body", ""),
+            "parent_id": str(mock_page.get("parent_id")) if mock_page.get("parent_id") else None,
+            "last_updated": mock_page.get("last_updated", "")
+        })
+    return results
+
+@tool
+def fetch_confluence_space_pages(space_id: str) -> str:
+    """
+    Fetch all documentation pages inside a Confluence Space ID using CQL,
+    returning their combined text titles and summaries.
+    Useful to discover page structures and documents in a space.
+    """
+    pages = fetch_confluence_pages_by_space(space_id)
+    if not pages:
+        return f"No Confluence pages found in space ID '{space_id}'."
+        
+    output = [f"Retrieved {len(pages)} pages in space '{space_id}':"]
+    for page in pages:
+        parent_info = f" (Parent: {page['parent_id']})" if page['parent_id'] else ""
+        body_snippet = page['body'][:200].replace("\n", " ") + "..." if len(page['body']) > 200 else page['body']
+        output.append(f"- [{page['id']}] {page['title']}{parent_info}\n  Snippet: {body_snippet}")
+        
+    return "\n".join(output)
+
 @tool
 def fetch_confluence_hierarchy(parent_page_id: str) -> str:
     """
@@ -185,4 +275,5 @@ def fetch_confluence_hierarchy(parent_page_id: str) -> str:
         output.append(f"- [{page['id']}] {page['title']}{parent_info}\n  Snippet: {body_snippet}")
         
     return "\n".join(output)
+
 

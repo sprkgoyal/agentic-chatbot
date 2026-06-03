@@ -41,16 +41,43 @@ class VectorService:
     def _compute_hash(self, content: str) -> str:
         return hashlib.md5(content.encode("utf-8")).hexdigest()
 
-    def sync_confluence_pages(self, pages: List[Dict[str, Any]], callback: Optional[Callable[[str], None]] = None):
+    def sync_confluence_pages(self, pages: List[Dict[str, Any]], space_id: str, callback: Optional[Callable[[str], None]] = None):
         """
-        Incrementally index Confluence pages in bulk.
+        Incrementally index Confluence pages in bulk for a space.
         If a page hash matches existing metadata, skip. Otherwise, delete and re-index.
+        Any page that is no longer present in Confluence is deleted.
         """
-        logger.info(f"Starting Confluence VectorStore sync for {len(pages)} pages.")
+        logger.info(f"Starting Confluence VectorStore sync for space '{space_id}' with {len(pages)} pages.")
         
         all_docs_to_add = []
         ids_to_delete = []
         
+        # Query chroma for all documents matching space_id
+        existing_pages_in_db = self.confluence_db.get(where={"space_id": space_id})
+        existing_page_ids = set()
+        existing_chunk_ids_by_page = {}
+        
+        if existing_pages_in_db and existing_pages_in_db.get("ids"):
+            for db_id, db_meta in zip(existing_pages_in_db["ids"], existing_pages_in_db["metadatas"]):
+                pid = db_meta.get("page_id")
+                if pid:
+                    existing_page_ids.add(pid)
+                    if pid not in existing_chunk_ids_by_page:
+                        existing_chunk_ids_by_page[pid] = []
+                    existing_chunk_ids_by_page[pid].append(db_id)
+                    
+        fetched_page_ids = {str(page["id"]) for page in pages}
+        
+        # Identify deleted pages
+        deleted_page_ids = existing_page_ids - fetched_page_ids
+        for pid in deleted_page_ids:
+            msg = f"-> Page ID '{pid}' was deleted from Confluence space. Queueing for deletion."
+            logger.info(msg)
+            if callback:
+                callback(msg)
+            ids_to_delete.extend(existing_chunk_ids_by_page[pid])
+        
+        # Check updates or new pages
         for page in pages:
             page_id = str(page["id"])
             title = page["title"]
@@ -66,11 +93,16 @@ class VectorService:
                 callback(msg)
                 
             # Check if page exists with same hash
-            existing = self.confluence_db.get(where={"page_id": page_id})
-            if existing and existing["ids"]:
-                # Grab metadata of the first chunk
-                first_meta = existing["metadatas"][0]
-                if first_meta.get("hash") == content_hash:
+            if page_id in existing_page_ids:
+                # Find the hash from existing metadata
+                first_meta = None
+                if existing_pages_in_db and existing_pages_in_db.get("metadatas"):
+                    for meta in existing_pages_in_db["metadatas"]:
+                        if meta.get("page_id") == page_id:
+                            first_meta = meta
+                            break
+                            
+                if first_meta and first_meta.get("hash") == content_hash:
                     msg = f"-> Confluence page '{title}' is up to date (hash matches). Skipping."
                     logger.info(msg)
                     if callback:
@@ -82,9 +114,9 @@ class VectorService:
                 logger.info(msg)
                 if callback:
                     callback(msg)
-                ids_to_delete.extend(existing["ids"])
+                ids_to_delete.extend(existing_chunk_ids_by_page[page_id])
             
-            # Smart chunking for Confluence: Recursive Text Splitter
+            # Chunking
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=150,
@@ -97,6 +129,7 @@ class VectorService:
                     page_content=f"Page Title: {title}\nContent:\n{chunk}",
                     metadata={
                         "page_id": page_id,
+                        "space_id": space_id,
                         "title": title,
                         "parent_id": parent_id or "none",
                         "last_updated": last_updated,
@@ -114,7 +147,7 @@ class VectorService:
                 
         # Bulk Database Writes
         if ids_to_delete:
-            msg = f"Deleting {len(ids_to_delete)} outdated Confluence chunks..."
+            msg = f"Deleting {len(ids_to_delete)} outdated or deleted Confluence chunks..."
             logger.info(msg)
             if callback:
                 callback(msg)
@@ -260,14 +293,14 @@ class VectorService:
                 
         logger.info("GitHub VectorStore sync completed.")
 
-    def search_confluence(self, query: str, limit: int = 5, page_filter: Optional[str] = None) -> List[Document]:
-        """Smart retrieval on Confluence database with optional page_id metadata filter."""
-        logger.info(f"Searching Confluence vector store. Query: '{query}', limit: {limit}, page_filter: {page_filter}")
+    def search_confluence(self, query: str, limit: int = 5, space_filter: Optional[str] = None) -> List[Document]:
+        """Smart retrieval on Confluence database with optional space_id metadata filter."""
+        logger.info(f"Searching Confluence vector store. Query: '{query}', limit: {limit}, space_filter: {space_filter}")
         where_filter = {"source": "confluence"}
-        if page_filter:
+        if space_filter:
             where_filter = {
                 "source": "confluence",
-                "page_id": page_filter
+                "space_id": space_filter
             }
             
         results = self.confluence_db.similarity_search(query, k=limit, filter=where_filter)
