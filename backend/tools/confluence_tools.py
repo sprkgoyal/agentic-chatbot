@@ -131,7 +131,7 @@ def fetch_confluence_pages_recursive(parent_page_id: str) -> List[Dict[str, Any]
         children_ids = []
         if base_url and auth:
             # Try V2 first
-            v2_child_url = f"{base_url}/api/v2/pages/{current_id}/children"
+            v2_child_url = f"{base_url}/rest/api/v2/pages/{current_id}/children"
             try:
                 res = requests.get(v2_child_url, auth=auth, headers=headers, timeout=5)
                 if res.status_code == 200:

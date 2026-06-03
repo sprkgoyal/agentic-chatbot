@@ -5,6 +5,9 @@ load_dotenv()
 
 # We support "openai" and "google"
 DEFAULT_PROVIDER = os.getenv("LLM_PROVIDER", "").lower()
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL_NAME", None)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", None)
+DEFAULT_GOOGLE_MODEL = os.getenv("GOOGLE_MODEL_NAME", "").lower()
 
 
 def get_active_provider() -> str:
@@ -29,7 +32,7 @@ def get_active_provider() -> str:
     )
 
 
-def get_llm(temperature: float = 0.2, model_name: str = None):
+def get_llm(temperature: float = 0.2):
     """
     Returns the appropriate LangChain chat model.
     By default:
@@ -41,16 +44,16 @@ def get_llm(temperature: float = 0.2, model_name: str = None):
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        model = model_name or "gpt-4o"
+        model = DEFAULT_OPENAI_MODEL or "gpt-4o"
         return ChatOpenAI(
             model=model,
             temperature=temperature,
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=OPENAI_BASE_URL
         )
     elif provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
-        model = model_name or "gemini-3.1-flash-lite"
+        model = DEFAULT_GOOGLE_MODEL or "gemini-3.1-flash-lite"
         return ChatGoogleGenerativeAI(
             model=model,
             temperature=temperature,
@@ -95,15 +98,15 @@ def get_embeddings():
         from langchain_openai import OpenAIEmbeddings
 
         actual = OpenAIEmbeddings(
-            model="text-embedding-3-small", openai_api_key=os.getenv("OPENAI_API_KEY")
+            model="BAAI/bge-m3",
+            base_url="http://107.99.236.181:5678/v1"
         )
         return SafeEmbeddings(actual, dim=1536)
     elif provider == "google":
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
         actual = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
-            google_api_key=os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
+            model="models/text-embedding-004"
         )
         return SafeEmbeddings(actual, dim=768)
     else:

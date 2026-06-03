@@ -4,9 +4,9 @@ import logging
 from typing import List, Dict, Any, Optional, Callable
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from services.llm_factory import get_embeddings
-from tools.mock_data import MOCK_GITHUB_REPOS, MOCK_CONFLUENCE_PAGES
+from tools.mock_data import MOCK_GITHUB_REPOS
 
 PERSIST_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "db", "chroma")
 
